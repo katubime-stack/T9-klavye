@@ -9,10 +9,12 @@ import android.os.Looper
 import android.text.InputType
 import android.text.SpannableString
 import android.text.Spanned
+import android.text.TextUtils
 import android.text.style.ForegroundColorSpan
 import android.text.style.RelativeSizeSpan
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.widget.HorizontalScrollView
@@ -44,6 +46,8 @@ class T9Service : InputMethodService() {
     private var candidates: List<String> = emptyList()
     private var index = 0
     private var shift = false
+    private var autoShift = false
+    private var autoCapAllowed = false
     private var t9On = true
     private var symbolMode = false
 
@@ -52,6 +56,16 @@ class T9Service : InputMethodService() {
     private var pendingIdx = 0
     private val manualWord = StringBuilder()
     private val commitRunnable = Runnable { commitPending() }
+    private val autoCapRunnable = Runnable { autoCap() }
+
+    private var repeatCount = 0
+    private val repeatRunnable = object : Runnable {
+        override fun run() {
+            repeatCount++
+            if (repeatCount > 15) deleteWord() else onBackspace()
+            handler.postDelayed(this, if (repeatCount > 15) 160L else 60L)
+        }
+    }
 
     private lateinit var candidateBar: LinearLayout
     private lateinit var shiftKey: TextView
@@ -75,19 +89,32 @@ class T9Service : InputMethodService() {
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
         handler.removeCallbacks(commitRunnable)
+        handler.removeCallbacks(repeatRunnable)
         pendingActive = false
         manualWord.setLength(0)
         digits = ""
         candidates = emptyList()
         index = 0
         resetShift()
+
+        val type = info?.inputType ?: 0
+        val cls = type and InputType.TYPE_MASK_CLASS
+        val v = type and InputType.TYPE_MASK_VARIATION
+        autoCapAllowed = cls == InputType.TYPE_CLASS_TEXT &&
+            v != InputType.TYPE_TEXT_VARIATION_PASSWORD &&
+            v != InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD &&
+            v != InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD &&
+            v != InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS &&
+            v != InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS &&
+            v != InputType.TYPE_TEXT_VARIATION_URI
+
         if (!restarting && ::mainArea.isInitialized && ::symbolArea.isInitialized &&
             ::modeKey.isInitialized
         ) {
-            val cls = (info?.inputType ?: 0) and InputType.TYPE_MASK_CLASS
             setSymbolMode(cls == InputType.TYPE_CLASS_NUMBER || cls == InputType.TYPE_CLASS_PHONE)
         }
         renderBar()
+        autoCapSoon()
     }
 
     // ---------- Sözlük ----------
@@ -146,6 +173,35 @@ class T9Service : InputMethodService() {
         }
     }
 
+    // ---------- Büyük harf ----------
+    private fun setShift(on: Boolean) {
+        shift = on
+        if (::shiftKey.isInitialized) shiftKey.setTextColor(if (on) teal else Color.WHITE)
+    }
+
+    private fun resetShift() {
+        autoShift = false
+        setShift(false)
+    }
+
+    private fun autoCapSoon() {
+        handler.removeCallbacks(autoCapRunnable)
+        handler.postDelayed(autoCapRunnable, 60)
+    }
+
+    private fun autoCap() {
+        if (!autoCapAllowed || digits.isNotEmpty() || pendingActive) return
+        val mode = currentInputConnection?.getCursorCapsMode(TextUtils.CAP_MODE_SENTENCES) ?: 0
+        if (mode != 0) {
+            autoShift = true
+            setShift(true)
+            if (digits.isNotEmpty()) showComposing()
+        } else if (autoShift) {
+            autoShift = false
+            setShift(false)
+        }
+    }
+
     // ---------- T9 mantığı ----------
     private fun cap(w: String) =
         if (w.isEmpty()) w else w.substring(0, 1).uppercase(tr) + w.substring(1)
@@ -179,11 +235,6 @@ class T9Service : InputMethodService() {
 
     private fun showComposing() {
         currentInputConnection?.setComposingText(current(), 1)
-    }
-
-    private fun resetShift() {
-        shift = false
-        if (::shiftKey.isInitialized) shiftKey.setTextColor(Color.WHITE)
     }
 
     private fun commitWord(trailing: String) {
@@ -288,6 +339,24 @@ class T9Service : InputMethodService() {
         }
         if (manualWord.isNotEmpty()) manualWord.setLength(manualWord.length - 1)
         sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+        autoCapSoon()
+    }
+
+    private fun deleteWord() {
+        val ic = currentInputConnection ?: return
+        if (pendingActive || digits.isNotEmpty()) {
+            onBackspace()
+            return
+        }
+        val before = ic.getTextBeforeCursor(40, 0)?.toString() ?: ""
+        if (before.isEmpty()) return
+        var i = before.length
+        while (i > 0 && before[i - 1].isWhitespace()) i--
+        while (i > 0 && !before[i - 1].isWhitespace()) i--
+        val count = before.length - i
+        if (count > 0) ic.deleteSurroundingText(count, 0)
+        manualWord.setLength(0)
+        autoCapSoon()
     }
 
     private fun onEnter() {
@@ -303,17 +372,20 @@ class T9Service : InputMethodService() {
         } else {
             sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
         }
+        autoCapSoon()
     }
 
     private fun punct(s: String) {
         commitAll()
         finishManualWord()
         currentInputConnection?.commitText(s, 1)
+        resetShift()
+        autoCapSoon()
     }
 
     private fun toggleShift() {
-        shift = !shift
-        shiftKey.setTextColor(if (shift) teal else Color.WHITE)
+        autoShift = false
+        setShift(!shift)
         if (digits.isNotEmpty()) {
             showComposing()
             renderBar()
@@ -382,6 +454,27 @@ class T9Service : InputMethodService() {
         return tv
     }
 
+    private fun makeBackspaceKey(): TextView {
+        val tv = makeKey("⌫", null, 22f) { }
+        tv.setOnTouchListener { v, ev ->
+            when (ev.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    v.isPressed = true
+                    onBackspace()
+                    repeatCount = 0
+                    handler.removeCallbacks(repeatRunnable)
+                    handler.postDelayed(repeatRunnable, 400)
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    v.isPressed = false
+                    handler.removeCallbacks(repeatRunnable)
+                }
+            }
+            true
+        }
+        return tv
+    }
+
     private fun renderBar() {
         if (!::candidateBar.isInitialized) return
         candidateBar.removeAllViews()
@@ -395,6 +488,7 @@ class T9Service : InputMethodService() {
             tv.setOnClickListener {
                 index = i
                 commitWord(" ")
+                autoCapSoon()
             }
             candidateBar.addView(tv, LinearLayout.LayoutParams(WRAP, MATCH))
         }
@@ -441,7 +535,7 @@ class T9Service : InputMethodService() {
 
         val right = LinearLayout(this)
         right.orientation = LinearLayout.VERTICAL
-        right.addView(makeKey("⌫", null, 22f) { onBackspace() }, lp(MATCH, 0, 1f))
+        right.addView(makeBackspaceKey(), lp(MATCH, 0, 1f))
         right.addView(makeKey("Sonraki", "0", 13f) { onNext() }, lp(MATCH, 0, 1f))
         shiftKey = makeKey("⇧", null, 24f) { toggleShift() }
         right.addView(shiftKey, lp(MATCH, 0, 1f))
@@ -470,7 +564,7 @@ class T9Service : InputMethodService() {
         symbolArea.addView(sScroll, LinearLayout.LayoutParams(0, MATCH, 6f))
         val sRight = LinearLayout(this)
         sRight.orientation = LinearLayout.VERTICAL
-        sRight.addView(makeKey("⌫", null, 22f) { onBackspace() }, lp(MATCH, 0, 1f))
+        sRight.addView(makeBackspaceKey(), lp(MATCH, 0, 1f))
         symbolArea.addView(sRight, LinearLayout.LayoutParams(0, MATCH, 1f))
         root.addView(symbolArea, LinearLayout.LayoutParams(MATCH, dp(176)))
 
@@ -483,12 +577,4 @@ class T9Service : InputMethodService() {
         t9Key.setTextColor(if (t9On) teal else Color.WHITE)
         bottom.addView(t9Key, lp(0, MATCH, 1f))
         bottom.addView(makeKey(",", null) { punct(",") }, lp(0, MATCH, 0.7f))
-        bottom.addView(makeKey("Türkçe", null, 14f) { punct(" ") }, lp(0, MATCH, 3f))
-        bottom.addView(makeKey(".", null) { punct(".") }, lp(0, MATCH, 0.7f))
-        bottom.addView(makeKey("↵", null, 22f) { onEnter() }, lp(0, MATCH, 1.2f))
-        root.addView(bottom, LinearLayout.LayoutParams(MATCH, dp(52)))
-
-        setSymbolMode(symbolMode)
-        return root
-    }
-}
+        bottom.addView(makeKey("Türkçe", null, 14f) { punct
