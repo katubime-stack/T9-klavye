@@ -11,6 +11,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Sozluk hazirla
+        run: python3 sozluk.py
+
       - name: Java kur
         uses: actions/setup-java@v4
         with:
