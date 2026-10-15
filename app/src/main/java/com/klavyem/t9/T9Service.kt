@@ -577,4 +577,12 @@ class T9Service : InputMethodService() {
         t9Key.setTextColor(if (t9On) teal else Color.WHITE)
         bottom.addView(t9Key, lp(0, MATCH, 1f))
         bottom.addView(makeKey(",", null) { punct(",") }, lp(0, MATCH, 0.7f))
-        bottom.addView(makeKey("Türkçe", null, 14f) { punct
+        bottom.addView(makeKey("Türkçe", null, 14f) { punct(" ") }, lp(0, MATCH, 3f))
+        bottom.addView(makeKey(".", null) { punct(".") }, lp(0, MATCH, 0.7f))
+        bottom.addView(makeKey("↵", null, 22f) { onEnter() }, lp(0, MATCH, 1.2f))
+        root.addView(bottom, LinearLayout.LayoutParams(MATCH, dp(52)))
+
+        setSymbolMode(symbolMode)
+        return root
+    }
+}
