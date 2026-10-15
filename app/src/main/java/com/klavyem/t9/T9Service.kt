@@ -1,5 +1,7 @@
 package com.klavyem.t9
 
+import android.content.ClipboardManager
+import android.content.Context
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.StateListDrawable
@@ -49,7 +51,7 @@ class T9Service : InputMethodService() {
     private var autoShift = false
     private var autoCapAllowed = false
     private var t9On = true
-    private var symbolMode = false
+    private var panel = 0
 
     private var pendingActive = false
     private var pendingKey = '2'
@@ -67,12 +69,21 @@ class T9Service : InputMethodService() {
         }
     }
 
+    private val clips = ArrayList<String>()
+    private var lastClip = ""
+    private var clipboard: ClipboardManager? = null
+    private val clipListener = ClipboardManager.OnPrimaryClipChangedListener { captureClip() }
+
     private lateinit var candidateBar: LinearLayout
     private lateinit var shiftKey: TextView
     private lateinit var modeKey: TextView
     private lateinit var t9Key: TextView
     private lateinit var mainArea: LinearLayout
     private lateinit var symbolArea: LinearLayout
+    private lateinit var numArea: LinearLayout
+    private lateinit var emojiArea: LinearLayout
+    private lateinit var clipArea: LinearLayout
+    private lateinit var clipList: LinearLayout
 
     override fun onCreate() {
         super.onCreate()
@@ -82,6 +93,14 @@ class T9Service : InputMethodService() {
         }
         tapMap['1'] = ".,@?!'-"
         loadWords()
+        loadClips()
+        clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard?.addPrimaryClipChangedListener(clipListener)
+    }
+
+    override fun onDestroy() {
+        clipboard?.removePrimaryClipChangedListener(clipListener)
+        super.onDestroy()
     }
 
     override fun onEvaluateFullscreenMode(): Boolean = false
@@ -109,10 +128,14 @@ class T9Service : InputMethodService() {
             v != InputType.TYPE_TEXT_VARIATION_URI
 
         if (!restarting && ::mainArea.isInitialized && ::symbolArea.isInitialized &&
-            ::modeKey.isInitialized
+            ::numArea.isInitialized && ::emojiArea.isInitialized &&
+            ::clipArea.isInitialized && ::modeKey.isInitialized
         ) {
-            setSymbolMode(cls == InputType.TYPE_CLASS_NUMBER || cls == InputType.TYPE_CLASS_PHONE)
+            showPanel(
+                if (cls == InputType.TYPE_CLASS_NUMBER || cls == InputType.TYPE_CLASS_PHONE) 2 else 0
+            )
         }
+        captureClip()
         renderBar()
         autoCapSoon()
     }
@@ -195,14 +218,12 @@ class T9Service : InputMethodService() {
         if (mode != 0) {
             autoShift = true
             setShift(true)
-            if (digits.isNotEmpty()) showComposing()
         } else if (autoShift) {
             autoShift = false
             setShift(false)
         }
     }
-
-    // ---------- T9 mantığı ----------
+        // ---------- T9 mantığı ----------
     private fun cap(w: String) =
         if (w.isEmpty()) w else w.substring(0, 1).uppercase(tr) + w.substring(1)
 
@@ -399,19 +420,115 @@ class T9Service : InputMethodService() {
         t9Key.setTextColor(if (t9On) teal else Color.WHITE)
     }
 
-    private fun setSymbolMode(on: Boolean) {
-        symbolMode = on
-        modeKey.text = if (on) "abc" else "12#"
-        mainArea.visibility = if (on) View.GONE else View.VISIBLE
-        symbolArea.visibility = if (on) View.VISIBLE else View.GONE
+    // ---------- Paneller ----------
+    // 0 = T9, 1 = simge, 2 = sayı, 3 = emoji, 4 = pano
+    private fun showPanel(p: Int) {
+        panel = p
+        modeKey.text = if (p == 0) "12#" else "abc"
+        mainArea.visibility = if (p == 0) View.VISIBLE else View.GONE
+        symbolArea.visibility = if (p == 1) View.VISIBLE else View.GONE
+        numArea.visibility = if (p == 2) View.VISIBLE else View.GONE
+        emojiArea.visibility = if (p == 3) View.VISIBLE else View.GONE
+        clipArea.visibility = if (p == 4) View.VISIBLE else View.GONE
+        if (p == 4) renderClips()
     }
 
     private fun toggleMode() {
         commitAll()
-        setSymbolMode(!symbolMode)
+        showPanel(if (panel == 0) 1 else 0)
     }
 
-    // ---------- Arayüz ----------
+    private fun togglePano() {
+        commitAll()
+        showPanel(if (panel == 4) 0 else 4)
+    }
+
+    // ---------- Pano ----------
+    private fun loadClips() {
+        try {
+            val f = File(filesDir, "pano.txt")
+            if (f.exists()) {
+                f.readText().split("\u001F").filter { it.isNotBlank() }.forEach { clips.add(it) }
+            }
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun saveClips() {
+        try {
+            File(filesDir, "pano.txt").writeText(clips.joinToString("\u001F"))
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun captureClip() {
+        try {
+            val cm = clipboard ?: return
+            val clip = cm.primaryClip ?: return
+            if (clip.itemCount == 0) return
+            val t = clip.getItemAt(0).coerceToText(this)?.toString() ?: return
+            if (t == lastClip) return
+            lastClip = t
+            addClip(t)
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun addClip(t: String) {
+        val s = t.trim()
+        if (s.isEmpty() || s.length > 2000) return
+        clips.remove(s)
+        clips.add(0, s)
+        while (clips.size > 30) clips.removeAt(clips.size - 1)
+        saveClips()
+        if (panel == 4) renderClips()
+    }
+
+    private fun pasteClip(t: String) {
+        commitAll()
+        manualWord.setLength(0)
+        currentInputConnection?.commitText(t, 1)
+        showPanel(0)
+        autoCapSoon()
+    }
+
+    private fun doAction(id: Int) {
+        commitAll()
+        currentInputConnection?.performContextMenuAction(id)
+    }
+
+    private fun renderClips() {
+        if (!::clipList.isInitialized) return
+        clipList.removeAllViews()
+        if (clips.isEmpty()) {
+            val tv = TextView(this)
+            tv.text = "Pano boş. Kopyaladığınız metinler burada görünür."
+            tv.setTextColor(Color.GRAY)
+            tv.textSize = 14f
+            tv.setPadding(dp(12), dp(12), dp(12), dp(12))
+            clipList.addView(tv)
+            return
+        }
+        for (c in ArrayList(clips)) {
+            val tv = TextView(this)
+            tv.text = c
+            tv.textSize = 15f
+            tv.maxLines = 2
+            tv.ellipsize = TextUtils.TruncateAt.END
+            tv.setTextColor(Color.WHITE)
+            tv.setPadding(dp(12), dp(8), dp(12), dp(8))
+            tv.background = keyBg()
+            tv.setOnClickListener { pasteClip(c) }
+            tv.setOnLongClickListener {
+                clips.remove(c)
+                saveClips()
+                renderClips()
+                true
+            }
+            clipList.addView(tv, lp(MATCH, WRAP, 0f))
+        }
+    }
+        // ---------- Arayüz ----------
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
     private fun lp(w: Int, h: Int, weight: Float) =
@@ -500,13 +617,18 @@ class T9Service : InputMethodService() {
         root.setBackgroundColor(Color.parseColor("#1E2124"))
         root.setPadding(dp(4), dp(4), dp(4), dp(8))
 
-        // Öneri çubuğu
+        // Üst çubuk: pano düğmesi + öneriler
+        val top = LinearLayout(this)
+        top.orientation = LinearLayout.HORIZONTAL
+        val panoKey = makeKey("📋", null, 18f) { togglePano() }
+        top.addView(panoKey, lp(dp(48), MATCH, 0f))
         candidateBar = LinearLayout(this)
         candidateBar.orientation = LinearLayout.HORIZONTAL
         val scroll = HorizontalScrollView(this)
         scroll.isHorizontalScrollBarEnabled = false
         scroll.addView(candidateBar)
-        root.addView(scroll, LinearLayout.LayoutParams(MATCH, dp(44)))
+        top.addView(scroll, LinearLayout.LayoutParams(0, MATCH, 1f))
+        root.addView(top, LinearLayout.LayoutParams(MATCH, dp(44)))
 
         // T9 alanı
         mainArea = LinearLayout(this)
@@ -540,10 +662,9 @@ class T9Service : InputMethodService() {
         shiftKey = makeKey("⇧", null, 24f) { toggleShift() }
         right.addView(shiftKey, lp(MATCH, 0, 1f))
         mainArea.addView(right, LinearLayout.LayoutParams(0, MATCH, 1f))
-
         root.addView(mainArea, LinearLayout.LayoutParams(MATCH, dp(176)))
 
-        // Sayı ve simge alanı
+        // Simge alanı
         symbolArea = LinearLayout(this)
         symbolArea.orientation = LinearLayout.HORIZONTAL
         val sScroll = ScrollView(this)
@@ -555,6 +676,7 @@ class T9Service : InputMethodService() {
             if (i % 10 == 0) {
                 srow = LinearLayout(this)
                 srow.orientation = LinearLayout.HORIZONTAL
+                srow.weightSum = 10f
                 box.addView(srow, LinearLayout.LayoutParams(MATCH, dp(44)))
             }
             val s = ch.toString()
@@ -565,8 +687,94 @@ class T9Service : InputMethodService() {
         val sRight = LinearLayout(this)
         sRight.orientation = LinearLayout.VERTICAL
         sRight.addView(makeBackspaceKey(), lp(MATCH, 0, 1f))
+        sRight.addView(makeKey("😀", null, 22f) { showPanel(3) }, lp(MATCH, 0, 1f))
+        sRight.addView(makeKey("123", null, 18f) { showPanel(2) }, lp(MATCH, 0, 1f))
         symbolArea.addView(sRight, LinearLayout.LayoutParams(0, MATCH, 1f))
         root.addView(symbolArea, LinearLayout.LayoutParams(MATCH, dp(176)))
+
+        // Sayı alanı
+        numArea = LinearLayout(this)
+        numArea.orientation = LinearLayout.HORIZONTAL
+        val nLeft = LinearLayout(this)
+        nLeft.orientation = LinearLayout.VERTICAL
+        for (p in listOf("+", "-", "*", "/")) {
+            nLeft.addView(makeKey(p, null, 22f) { punct(p) }, lp(MATCH, 0, 1f))
+        }
+        numArea.addView(nLeft, LinearLayout.LayoutParams(0, MATCH, 0.7f))
+        val nGrid = LinearLayout(this)
+        nGrid.orientation = LinearLayout.VERTICAL
+        val nrows = listOf(
+            listOf("1", "2", "3"), listOf("4", "5", "6"),
+            listOf("7", "8", "9"), listOf(",", "0", ".")
+        )
+        for (r in nrows) {
+            val nrow = LinearLayout(this)
+            nrow.orientation = LinearLayout.HORIZONTAL
+            for (s in r) {
+                nrow.addView(makeKey(s, null, 24f) { punct(s) }, lp(0, MATCH, 1f))
+            }
+            nGrid.addView(nrow, LinearLayout.LayoutParams(MATCH, 0, 1f))
+        }
+        numArea.addView(nGrid, LinearLayout.LayoutParams(0, MATCH, 3f))
+        val nRight = LinearLayout(this)
+        nRight.orientation = LinearLayout.VERTICAL
+        nRight.addView(makeKey("%", null, 22f) { punct("%") }, lp(MATCH, 0, 1f))
+        nRight.addView(makeKey("=", null, 22f) { punct("=") }, lp(MATCH, 0, 1f))
+        nRight.addView(makeBackspaceKey(), lp(MATCH, 0, 1f))
+        nRight.addView(makeKey("!?#", null, 16f) { showPanel(1) }, lp(MATCH, 0, 1f))
+        numArea.addView(nRight, LinearLayout.LayoutParams(0, MATCH, 1f))
+        root.addView(numArea, LinearLayout.LayoutParams(MATCH, dp(176)))
+
+        // Emoji alanı
+        emojiArea = LinearLayout(this)
+        emojiArea.orientation = LinearLayout.HORIZONTAL
+        val eScroll = ScrollView(this)
+        val eBox = LinearLayout(this)
+        eBox.orientation = LinearLayout.VERTICAL
+        val emojiler = ("😀 😃 😄 😁 😆 😅 😂 🤣 🙂 🙃 😉 😊 😇 🥰 😍 🤩 😘 😋 😛 😜 🤪 🤗 🤭 🤔 " +
+            "😐 😑 😶 😏 😒 🙄 😬 😌 😔 😪 😴 😷 🤒 🥵 🥶 😵 🤯 🤠 😎 🤓 😕 😟 🙁 😮 😲 😳 🥺 " +
+            "😨 😰 😥 😢 😭 😱 😖 😞 😓 😩 😫 🥱 😤 😡 😠 🤬 😈 💀 💩 🤡 👻 👽 🤖 " +
+            "👍 👎 👌 ✌️ 🤞 🤟 🤘 🤙 👈 👉 👆 👇 ☝️ ✋ 👋 👏 🙌 🤝 🙏 💪 " +
+            "❤️ 🧡 💛 💚 💙 💜 🖤 🤍 💔 💕 💞 💓 💗 💖 💘 💝 " +
+            "🔥 ✨ ⭐ 🌟 💥 💫 💦 🎉 🎊 🎁 🎂 🎈 🌹 🌸 🌞 🌙 ☀️ ❄️ 🌈 ☕ 🍕 🍔 🍟 🍰 🍎 🍌 🍉 🍺 " +
+            "⚽ 🏀 🎵 🎶 📱 💻 📷 🎮 🚗 ✈️ 🏠 💰 💯 ✅ ❌ ⚠️ ❓ ❗ 🇹🇷").split(" ")
+        var erow = LinearLayout(this)
+        for ((i, em) in emojiler.withIndex()) {
+            if (i % 8 == 0) {
+                erow = LinearLayout(this)
+                erow.orientation = LinearLayout.HORIZONTAL
+                erow.weightSum = 8f
+                eBox.addView(erow, LinearLayout.LayoutParams(MATCH, dp(46)))
+            }
+            erow.addView(makeKey(em, null, 22f) { punct(em) }, lp(0, MATCH, 1f))
+        }
+        eScroll.addView(eBox)
+        emojiArea.addView(eScroll, LinearLayout.LayoutParams(0, MATCH, 6f))
+        val eRight = LinearLayout(this)
+        eRight.orientation = LinearLayout.VERTICAL
+        eRight.addView(makeBackspaceKey(), lp(MATCH, 0, 1f))
+        eRight.addView(makeKey("!?#", null, 16f) { showPanel(1) }, lp(MATCH, 0, 1f))
+        eRight.addView(makeKey("123", null, 18f) { showPanel(2) }, lp(MATCH, 0, 1f))
+        emojiArea.addView(eRight, LinearLayout.LayoutParams(0, MATCH, 1f))
+        root.addView(emojiArea, LinearLayout.LayoutParams(MATCH, dp(176)))
+
+        // Pano alanı
+        clipArea = LinearLayout(this)
+        clipArea.orientation = LinearLayout.VERTICAL
+        val actions = LinearLayout(this)
+        actions.orientation = LinearLayout.HORIZONTAL
+        actions.addView(makeKey("Tümünü seç", null, 12f) { doAction(android.R.id.selectAll) }, lp(0, MATCH, 1.4f))
+        actions.addView(makeKey("Kes", null, 13f) { doAction(android.R.id.cut) }, lp(0, MATCH, 1f))
+        actions.addView(makeKey("Kopyala", null, 13f) { doAction(android.R.id.copy) }, lp(0, MATCH, 1.2f))
+        actions.addView(makeKey("Yapıştır", null, 13f) { doAction(android.R.id.paste) }, lp(0, MATCH, 1.3f))
+        actions.addView(makeBackspaceKey(), lp(0, MATCH, 0.9f))
+        clipArea.addView(actions, LinearLayout.LayoutParams(MATCH, dp(44)))
+        val cScroll = ScrollView(this)
+        clipList = LinearLayout(this)
+        clipList.orientation = LinearLayout.VERTICAL
+        cScroll.addView(clipList)
+        clipArea.addView(cScroll, LinearLayout.LayoutParams(MATCH, 0, 1f))
+        root.addView(clipArea, LinearLayout.LayoutParams(MATCH, dp(176)))
 
         // Alt satır
         val bottom = LinearLayout(this)
@@ -582,7 +790,7 @@ class T9Service : InputMethodService() {
         bottom.addView(makeKey("↵", null, 22f) { onEnter() }, lp(0, MATCH, 1.2f))
         root.addView(bottom, LinearLayout.LayoutParams(MATCH, dp(52)))
 
-        setSymbolMode(symbolMode)
+        showPanel(panel)
         return root
     }
 }
