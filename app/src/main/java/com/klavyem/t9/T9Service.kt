@@ -19,12 +19,21 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
+import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import java.io.File
 import java.util.Locale
+
+private const val EMOJIS =
+    "😀 😃 😄 😁 😆 😅 😂 🤣 🙂 🙃 😉 😊 😇 🥰 😍 🤩 😘 😋 😛 😜 🤪 🤗 🤭 🤔 " +
+    "😐 😑 😶 😏 😒 🙄 😬 😌 😔 😪 😴 😷 🤒 🤕 🤢 🤮 🥵 🥶 😵 🤯 🤠 🥳 😎 🤓 " +
+    "😕 😟 🙁 😮 😲 😳 🥺 😦 😨 😰 😥 😢 😭 😱 😖 😣 😞 😓 😩 😫 🥱 😤 😡 😠 " +
+    "🤬 😈 💀 💩 🤡 👻 👽 🤖 👍 👎 👌 🤞 🤟 🤘 👈 👉 👆 👇 👋 🤚 ✋ 🖖 👏 🙌 " +
+    "🤝 🙏 💪 👀 🧠 🧡 💛 💚 💙 💜 🖤 🤍 💔 💕 💖 💯 🔥 ✨ ⭐ 🎉 🎁 🌹 🌸 🌙 " +
+    "☕ 🍕 🍔 🍰 🎂 ⚽ 🚗 🏠 📱 💻 📷 🎵 ✅ ❌ ❓ ❗"
 
 class T9Service : InputMethodService() {
 
@@ -44,6 +53,10 @@ class T9Service : InputMethodService() {
     private var codes = ArrayList<String>()
     private var wordSet = HashSet<String>()
 
+    // Sonraki kelime tahmini
+    private var bigram = HashMap<String, List<String>>()
+    private var nextWords: List<String> = emptyList()
+
     private var digits = ""
     private var candidates: List<String> = emptyList()
     private var index = 0
@@ -52,13 +65,18 @@ class T9Service : InputMethodService() {
     private var autoCapAllowed = false
     private var t9On = true
     private var panel = 0
+    private var uiReady = false
 
     private var pendingActive = false
     private var pendingKey = '2'
     private var pendingIdx = 0
     private val manualWord = StringBuilder()
     private val commitRunnable = Runnable { commitPending() }
-    private val autoCapRunnable = Runnable { autoCap() }
+    private val autoCapRunnable = Runnable {
+        autoCap()
+        refreshNext()
+        renderBar()
+    }
 
     private var repeatCount = 0
     private val repeatRunnable = object : Runnable {
@@ -100,6 +118,7 @@ class T9Service : InputMethodService() {
 
     override fun onDestroy() {
         clipboard?.removePrimaryClipChangedListener(clipListener)
+        handler.removeCallbacksAndMessages(null)
         super.onDestroy()
     }
 
@@ -113,6 +132,7 @@ class T9Service : InputMethodService() {
         manualWord.setLength(0)
         digits = ""
         candidates = emptyList()
+        nextWords = emptyList()
         index = 0
         resetShift()
 
@@ -127,10 +147,7 @@ class T9Service : InputMethodService() {
             v != InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS &&
             v != InputType.TYPE_TEXT_VARIATION_URI
 
-        if (!restarting && ::mainArea.isInitialized && ::symbolArea.isInitialized &&
-            ::numArea.isInitialized && ::emojiArea.isInitialized &&
-            ::clipArea.isInitialized && ::modeKey.isInitialized
-        ) {
+        if (!restarting && uiReady) {
             showPanel(
                 if (cls == InputType.TYPE_CLASS_NUMBER || cls == InputType.TYPE_CLASS_PHONE) 2 else 0
             )
@@ -168,10 +185,24 @@ class T9Service : InputMethodService() {
                 }
             } catch (e: Exception) {
             }
+            val bg = HashMap<String, List<String>>()
+            try {
+                assets.open("bigram.tsv").bufferedReader().use { r ->
+                    r.lineSequence().forEach { line ->
+                        val p = line.trim().split(Regex("\\s+"), 2)
+                        if (p.size == 2) {
+                            val list = p[1].split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                            if (list.isNotEmpty()) bg[p[0].lowercase(tr)] = list
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+            }
             handler.post {
                 words = w
                 codes = c
                 wordSet = seen
+                bigram = bg
             }
         }.start()
     }
@@ -196,6 +227,19 @@ class T9Service : InputMethodService() {
         }
     }
 
+    // ---------- Sonraki kelime tahmini ----------
+    // İmlecin önündeki metne bakar: son karakter boşluksa ve ondan önce bir kelime varsa
+    // o kelimenin bigram listesini öneri olarak gösterir.
+    private fun refreshNext() {
+        nextWords = emptyList()
+        if (digits.isNotEmpty() || pendingActive || bigram.isEmpty()) return
+        val before = currentInputConnection?.getTextBeforeCursor(60, 0)?.toString() ?: return
+        if (before.isEmpty() || before.last() != ' ') return
+        val last = before.trimEnd().takeLastWhile { it.isLetter() }
+        if (last.isEmpty()) return
+        nextWords = bigram[last.lowercase(tr)] ?: emptyList()
+    }
+
     // ---------- Büyük harf ----------
     private fun setShift(on: Boolean) {
         shift = on
@@ -209,7 +253,7 @@ class T9Service : InputMethodService() {
 
     private fun autoCapSoon() {
         handler.removeCallbacks(autoCapRunnable)
-        handler.postDelayed(autoCapRunnable, 60)
+        handler.postDelayed(autoCapRunnable, 80)
     }
 
     private fun autoCap() {
@@ -223,7 +267,8 @@ class T9Service : InputMethodService() {
             setShift(false)
         }
     }
-        // ---------- T9 mantığı ----------
+
+    // ---------- T9 mantığı ----------
     private fun cap(w: String) =
         if (w.isEmpty()) w else w.substring(0, 1).uppercase(tr) + w.substring(1)
 
@@ -250,6 +295,7 @@ class T9Service : InputMethodService() {
         if (list.isEmpty()) list.add(digits.map { keyMap[it]!![0] }.joinToString(""))
         candidates = list
         index = 0
+        nextWords = emptyList()
         showComposing()
         renderBar()
     }
@@ -290,6 +336,7 @@ class T9Service : InputMethodService() {
             pendingIdx = 0
             pendingActive = true
         }
+        nextWords = emptyList()
         currentInputConnection?.setComposingText(letterFor(d, pendingIdx), 1)
         handler.postDelayed(commitRunnable, 900)
     }
@@ -339,6 +386,18 @@ class T9Service : InputMethodService() {
         }
     }
 
+    private fun onSpace() {
+        if (digits.isNotEmpty()) {
+            commitWord(" ")
+        } else {
+            commitPending()
+            finishManualWord()
+            currentInputConnection?.commitText(" ", 1)
+            resetShift()
+        }
+        autoCapSoon()
+    }
+
     private fun onBackspace() {
         if (pendingActive) {
             handler.removeCallbacks(commitRunnable)
@@ -359,6 +418,7 @@ class T9Service : InputMethodService() {
             return
         }
         if (manualWord.isNotEmpty()) manualWord.setLength(manualWord.length - 1)
+        nextWords = emptyList()
         sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
         autoCapSoon()
     }
@@ -377,6 +437,7 @@ class T9Service : InputMethodService() {
         val count = before.length - i
         if (count > 0) ic.deleteSurroundingText(count, 0)
         manualWord.setLength(0)
+        nextWords = emptyList()
         autoCapSoon()
     }
 
@@ -393,6 +454,7 @@ class T9Service : InputMethodService() {
         } else {
             sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
         }
+        nextWords = emptyList()
         autoCapSoon()
     }
 
@@ -401,16 +463,15 @@ class T9Service : InputMethodService() {
         finishManualWord()
         currentInputConnection?.commitText(s, 1)
         resetShift()
+        nextWords = emptyList()
         autoCapSoon()
     }
 
     private fun toggleShift() {
         autoShift = false
         setShift(!shift)
-        if (digits.isNotEmpty()) {
-            showComposing()
-            renderBar()
-        }
+        if (digits.isNotEmpty()) showComposing()
+        renderBar()
     }
 
     private fun toggleT9() {
@@ -488,6 +549,7 @@ class T9Service : InputMethodService() {
         commitAll()
         manualWord.setLength(0)
         currentInputConnection?.commitText(t, 1)
+        nextWords = emptyList()
         showPanel(0)
         autoCapSoon()
     }
@@ -528,7 +590,8 @@ class T9Service : InputMethodService() {
             clipList.addView(tv, lp(MATCH, WRAP, 0f))
         }
     }
-        // ---------- Arayüz ----------
+
+    // ---------- Arayüz yardımcıları ----------
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
     private fun lp(w: Int, h: Int, weight: Float) =
@@ -592,205 +655,245 @@ class T9Service : InputMethodService() {
         return tv
     }
 
+    private fun hLayout(): LinearLayout {
+        val l = LinearLayout(this)
+        l.orientation = LinearLayout.HORIZONTAL
+        return l
+    }
+
+    private fun vLayout(): LinearLayout {
+        val l = LinearLayout(this)
+        l.orientation = LinearLayout.VERTICAL
+        return l
+    }
+
+    private fun spacer(weight: Float): View {
+        val v = View(this)
+        v.layoutParams = lp(0, MATCH, weight)
+        return v
+    }
+
+    // ---------- Öneri çubuğu ----------
     private fun renderBar() {
         if (!::candidateBar.isInitialized) return
         candidateBar.removeAllViews()
-        candidates.forEachIndexed { i, w ->
-            val tv = TextView(this)
-            tv.text = if (shift) cap(w) else w
-            tv.textSize = 18f
-            tv.setPadding(dp(14), 0, dp(14), 0)
-            tv.gravity = Gravity.CENTER_VERTICAL
-            tv.setTextColor(if (i == index) teal else Color.WHITE)
-            tv.setOnClickListener {
-                index = i
-                commitWord(" ")
-                autoCapSoon()
+        if (candidates.isNotEmpty()) {
+            candidates.forEachIndexed { i, w ->
+                val tv = TextView(this)
+                tv.text = if (shift) cap(w) else w
+                tv.textSize = 18f
+                tv.setPadding(dp(14), 0, dp(14), 0)
+                tv.gravity = Gravity.CENTER_VERTICAL
+                tv.setTextColor(if (i == index) teal else Color.WHITE)
+                tv.setOnClickListener {
+                    index = i
+                    commitWord(" ")
+                    autoCapSoon()
+                }
+                candidateBar.addView(tv, LinearLayout.LayoutParams(WRAP, MATCH))
             }
-            candidateBar.addView(tv, LinearLayout.LayoutParams(WRAP, MATCH))
+        } else if (digits.isEmpty() && !pendingActive) {
+            for (w in nextWords) {
+                val shown = if (shift) cap(w) else w
+                val tv = TextView(this)
+                tv.text = shown
+                tv.textSize = 18f
+                tv.setPadding(dp(14), 0, dp(14), 0)
+                tv.gravity = Gravity.CENTER_VERTICAL
+                tv.setTextColor(Color.WHITE)
+                tv.setOnClickListener {
+                    currentInputConnection?.commitText("$shown ", 1)
+                    resetShift()
+                    nextWords = emptyList()
+                    renderBar()
+                    autoCapSoon()
+                }
+                candidateBar.addView(tv, LinearLayout.LayoutParams(WRAP, MATCH))
+            }
         }
     }
 
-    override fun onCreateInputView(): View {
-        val root = LinearLayout(this)
-        root.orientation = LinearLayout.VERTICAL
-        root.setBackgroundColor(Color.parseColor("#1E2124"))
-        root.setPadding(dp(4), dp(4), dp(4), dp(8))
+    // ---------- Panellerin kurulumu ----------
+    private fun digitKey(d: Char, main: String): TextView =
+        makeKey(main, d.toString(), 22f) { onDigit(d) }
 
-        // Üst çubuk: pano düğmesi + öneriler
-        val top = LinearLayout(this)
-        top.orientation = LinearLayout.HORIZONTAL
-        val panoKey = makeKey("📋", null, 18f) { togglePano() }
-        top.addView(panoKey, lp(dp(48), MATCH, 0f))
-        candidateBar = LinearLayout(this)
-        candidateBar.orientation = LinearLayout.HORIZONTAL
-        val scroll = HorizontalScrollView(this)
-        scroll.isHorizontalScrollBarEnabled = false
-        scroll.addView(candidateBar)
-        top.addView(scroll, LinearLayout.LayoutParams(0, MATCH, 1f))
-        root.addView(top, LinearLayout.LayoutParams(MATCH, dp(44)))
+    private fun buildMain(): LinearLayout {
+        val a = hLayout()
 
-        // T9 alanı
-        mainArea = LinearLayout(this)
-        mainArea.orientation = LinearLayout.HORIZONTAL
-
-        val left = LinearLayout(this)
-        left.orientation = LinearLayout.VERTICAL
-        for (p in listOf("!", "?", "'", "~")) {
-            left.addView(makeKey(p, null) { punct(p) }, lp(MATCH, 0, 1f))
+        val left = vLayout()
+        for (s in listOf("!", "?", "'", "~")) {
+            left.addView(makeKey(s, null, 20f) { punct(s) }, lp(MATCH, 0, 1f))
         }
-        mainArea.addView(left, LinearLayout.LayoutParams(0, MATCH, 0.6f))
+        a.addView(left, lp(0, MATCH, 0.6f))
 
-        val grid = LinearLayout(this)
-        grid.orientation = LinearLayout.VERTICAL
-        val rows = listOf(listOf('1', '2', '3'), listOf('4', '5', '6'), listOf('7', '8', '9'))
-        for (r in rows) {
-            val row = LinearLayout(this)
-            row.orientation = LinearLayout.HORIZONTAL
-            for (d in r) {
-                val lab = if (d == '1') "@" else keyMap[d]!!
-                row.addView(makeKey(lab, d.toString()) { onDigit(d) }, lp(0, MATCH, 1f))
-            }
-            grid.addView(row, LinearLayout.LayoutParams(MATCH, 0, 1f))
-        }
-        mainArea.addView(grid, LinearLayout.LayoutParams(0, MATCH, 3f))
+        val grid = vLayout()
 
-        val right = LinearLayout(this)
-        right.orientation = LinearLayout.VERTICAL
+        val r1 = hLayout()
+        r1.addView(digitKey('1', "@"), lp(0, MATCH, 1f))
+        r1.addView(digitKey('2', "abcç"), lp(0, MATCH, 1f))
+        r1.addView(digitKey('3', "def"), lp(0, MATCH, 1f))
+        r1.addView(makeBackspaceKey(), lp(0, MATCH, 1f))
+        grid.addView(r1, lp(MATCH, 0, 1f))
+
+        val r2 = hLayout()
+        r2.addView(digitKey('4', "ghıiğ"), lp(0, MATCH, 1f))
+        r2.addView(digitKey('5', "jkl"), lp(0, MATCH, 1f))
+        r2.addView(digitKey('6', "mnoö"), lp(0, MATCH, 1f))
+        r2.addView(makeKey("Sonraki", "0", 15f) { onNext() }, lp(0, MATCH, 1f))
+        grid.addView(r2, lp(MATCH, 0, 1f))
+
+        val r3 = hLayout()
+        r3.addView(digitKey('7', "pqrsş"), lp(0, MATCH, 1f))
+        r3.addView(digitKey('8', "tuüv"), lp(0, MATCH, 1f))
+        r3.addView(digitKey('9', "wxyz"), lp(0, MATCH, 1f))
+        shiftKey = makeKey("⇧", null, 26f) { toggleShift() }
+        r3.addView(shiftKey, lp(0, MATCH, 1f))
+        grid.addView(r3, lp(MATCH, 0, 1f))
+
+        a.addView(grid, lp(0, MATCH, 4f))
+        return a
+    }
+
+    private fun symbolRow(items: String, size: Float, fill: Int): LinearLayout {
+        val r = hLayout()
+        val list = items.split(" ").filter { it.isNotEmpty() }
+        for (s in list) r.addView(makeKey(s, null, size) { punct(s) }, lp(0, MATCH, 1f))
+        for (i in list.size until fill) r.addView(spacer(1f))
+        return r
+    }
+
+    private fun buildSymbols(): LinearLayout {
+        val a = hLayout()
+        val grid = vLayout()
+        grid.addView(symbolRow("+ - & _ ₺ # @ £ € $", 18f, 10), lp(MATCH, 0, 1f))
+        grid.addView(symbolRow("¢ ~ ` | • √ π ÷ × §", 18f, 10), lp(MATCH, 0, 1f))
+        grid.addView(symbolRow("∆ \\ } { = ° % © ® ™", 18f, 10), lp(MATCH, 0, 1f))
+        grid.addView(symbolRow("✓ [ ] < > ^", 18f, 10), lp(MATCH, 0, 1f))
+        a.addView(grid, lp(0, MATCH, 8.5f))
+
+        val right = vLayout()
         right.addView(makeBackspaceKey(), lp(MATCH, 0, 1f))
-        right.addView(makeKey("Sonraki", "0", 13f) { onNext() }, lp(MATCH, 0, 1f))
-        shiftKey = makeKey("⇧", null, 24f) { toggleShift() }
-        right.addView(shiftKey, lp(MATCH, 0, 1f))
-        mainArea.addView(right, LinearLayout.LayoutParams(0, MATCH, 1f))
-        root.addView(mainArea, LinearLayout.LayoutParams(MATCH, dp(176)))
+        right.addView(makeKey("😀", null, 22f) { commitAll(); showPanel(3) }, lp(MATCH, 0, 1f))
+        right.addView(makeKey("123", null, 20f) { commitAll(); showPanel(2) }, lp(MATCH, 0, 1f))
+        a.addView(right, lp(0, MATCH, 1.5f))
+        return a
+    }
+    private fun buildNumbers(): LinearLayout {
+        val a = vLayout()
+        fun numKey(s: String) = makeKey(s, null, 24f) { punct(s) }
 
-        // Simge alanı
-        symbolArea = LinearLayout(this)
-        symbolArea.orientation = LinearLayout.HORIZONTAL
-        val sScroll = ScrollView(this)
-        val box = LinearLayout(this)
-        box.orientation = LinearLayout.VERTICAL
-        val simgeler = "1234567890*\"':;!?/)(+-&_₺#@£€\$¢~`|•√π÷×§∆\\}{=°%©®™✓[]<>^"
-        var srow = LinearLayout(this)
-        for ((i, ch) in simgeler.withIndex()) {
-            if (i % 10 == 0) {
-                srow = LinearLayout(this)
-                srow.orientation = LinearLayout.HORIZONTAL
-                srow.weightSum = 10f
-                box.addView(srow, LinearLayout.LayoutParams(MATCH, dp(44)))
+        val r1 = hLayout()
+        for (s in listOf("+", "1", "2", "3", "%")) r1.addView(numKey(s), lp(0, MATCH, 1f))
+        a.addView(r1, lp(MATCH, 0, 1f))
+
+        val r2 = hLayout()
+        for (s in listOf("-", "4", "5", "6", "=")) r2.addView(numKey(s), lp(0, MATCH, 1f))
+        a.addView(r2, lp(MATCH, 0, 1f))
+
+        val r3 = hLayout()
+        for (s in listOf("*", "7", "8", "9")) r3.addView(numKey(s), lp(0, MATCH, 1f))
+        r3.addView(makeBackspaceKey(), lp(0, MATCH, 1f))
+        a.addView(r3, lp(MATCH, 0, 1f))
+
+        val r4 = hLayout()
+        for (s in listOf("/", ",", "0", ".")) r4.addView(numKey(s), lp(0, MATCH, 1f))
+        r4.addView(makeKey("!?#", null, 18f) { commitAll(); showPanel(1) }, lp(0, MATCH, 1f))
+        a.addView(r4, lp(MATCH, 0, 1f))
+        return a
+    }
+
+    private fun buildEmoji(): LinearLayout {
+        val a = hLayout()
+        val sv = ScrollView(this)
+        val col = vLayout()
+        val list = EMOJIS.split(" ").filter { it.isNotEmpty() }
+        var i = 0
+        while (i < list.size) {
+            val row = hLayout()
+            for (j in 0 until 8) {
+                val e = list.getOrNull(i + j)
+                val tv = TextView(this)
+                tv.gravity = Gravity.CENTER
+                tv.textSize = 24f
+                if (e != null) {
+                    tv.text = e
+                    tv.setOnClickListener { punct(e) }
+                }
+                row.addView(tv, LinearLayout.LayoutParams(0, dp(48), 1f))
             }
-            val s = ch.toString()
-            srow.addView(makeKey(s, null, 18f) { punct(s) }, lp(0, MATCH, 1f))
+            col.addView(row, LinearLayout.LayoutParams(MATCH, WRAP))
+            i += 8
         }
-        sScroll.addView(box)
-        symbolArea.addView(sScroll, LinearLayout.LayoutParams(0, MATCH, 6f))
-        val sRight = LinearLayout(this)
-        sRight.orientation = LinearLayout.VERTICAL
-        sRight.addView(makeBackspaceKey(), lp(MATCH, 0, 1f))
-        sRight.addView(makeKey("😀", null, 22f) { showPanel(3) }, lp(MATCH, 0, 1f))
-        sRight.addView(makeKey("123", null, 18f) { showPanel(2) }, lp(MATCH, 0, 1f))
-        symbolArea.addView(sRight, LinearLayout.LayoutParams(0, MATCH, 1f))
-        root.addView(symbolArea, LinearLayout.LayoutParams(MATCH, dp(176)))
+        sv.addView(col)
+        a.addView(sv, lp(0, MATCH, 8f))
 
-        // Sayı alanı
-        numArea = LinearLayout(this)
-        numArea.orientation = LinearLayout.HORIZONTAL
-        val nLeft = LinearLayout(this)
-        nLeft.orientation = LinearLayout.VERTICAL
-        for (p in listOf("+", "-", "*", "/")) {
-            nLeft.addView(makeKey(p, null, 22f) { punct(p) }, lp(MATCH, 0, 1f))
-        }
-        numArea.addView(nLeft, LinearLayout.LayoutParams(0, MATCH, 0.7f))
-        val nGrid = LinearLayout(this)
-        nGrid.orientation = LinearLayout.VERTICAL
-        val nrows = listOf(
-            listOf("1", "2", "3"), listOf("4", "5", "6"),
-            listOf("7", "8", "9"), listOf(",", "0", ".")
-        )
-        for (r in nrows) {
-            val nrow = LinearLayout(this)
-            nrow.orientation = LinearLayout.HORIZONTAL
-            for (s in r) {
-                nrow.addView(makeKey(s, null, 24f) { punct(s) }, lp(0, MATCH, 1f))
-            }
-            nGrid.addView(nrow, LinearLayout.LayoutParams(MATCH, 0, 1f))
-        }
-        numArea.addView(nGrid, LinearLayout.LayoutParams(0, MATCH, 3f))
-        val nRight = LinearLayout(this)
-        nRight.orientation = LinearLayout.VERTICAL
-        nRight.addView(makeKey("%", null, 22f) { punct("%") }, lp(MATCH, 0, 1f))
-        nRight.addView(makeKey("=", null, 22f) { punct("=") }, lp(MATCH, 0, 1f))
-        nRight.addView(makeBackspaceKey(), lp(MATCH, 0, 1f))
-        nRight.addView(makeKey("!?#", null, 16f) { showPanel(1) }, lp(MATCH, 0, 1f))
-        numArea.addView(nRight, LinearLayout.LayoutParams(0, MATCH, 1f))
-        root.addView(numArea, LinearLayout.LayoutParams(MATCH, dp(176)))
+        val right = vLayout()
+        right.addView(makeBackspaceKey(), lp(MATCH, 0, 1f))
+        right.addView(makeKey("!?#", null, 18f) { commitAll(); showPanel(1) }, lp(MATCH, 0, 1f))
+        right.addView(makeKey("123", null, 20f) { commitAll(); showPanel(2) }, lp(MATCH, 0, 1f))
+        a.addView(right, lp(0, MATCH, 1.5f))
+        return a
+    }
 
-        // Emoji alanı
-        emojiArea = LinearLayout(this)
-        emojiArea.orientation = LinearLayout.HORIZONTAL
-        val eScroll = ScrollView(this)
-        val eBox = LinearLayout(this)
-        eBox.orientation = LinearLayout.VERTICAL
-        val emojiler = ("😀 😃 😄 😁 😆 😅 😂 🤣 🙂 🙃 😉 😊 😇 🥰 😍 🤩 😘 😋 😛 😜 🤪 🤗 🤭 🤔 " +
-            "😐 😑 😶 😏 😒 🙄 😬 😌 😔 😪 😴 😷 🤒 🥵 🥶 😵 🤯 🤠 😎 🤓 😕 😟 🙁 😮 😲 😳 🥺 " +
-            "😨 😰 😥 😢 😭 😱 😖 😞 😓 😩 😫 🥱 😤 😡 😠 🤬 😈 💀 💩 🤡 👻 👽 🤖 " +
-            "👍 👎 👌 ✌️ 🤞 🤟 🤘 🤙 👈 👉 👆 👇 ☝️ ✋ 👋 👏 🙌 🤝 🙏 💪 " +
-            "❤️ 🧡 💛 💚 💙 💜 🖤 🤍 💔 💕 💞 💓 💗 💖 💘 💝 " +
-            "🔥 ✨ ⭐ 🌟 💥 💫 💦 🎉 🎊 🎁 🎂 🎈 🌹 🌸 🌞 🌙 ☀️ ❄️ 🌈 ☕ 🍕 🍔 🍟 🍰 🍎 🍌 🍉 🍺 " +
-            "⚽ 🏀 🎵 🎶 📱 💻 📷 🎮 🚗 ✈️ 🏠 💰 💯 ✅ ❌ ⚠️ ❓ ❗ 🇹🇷").split(" ")
-        var erow = LinearLayout(this)
-        for ((i, em) in emojiler.withIndex()) {
-            if (i % 8 == 0) {
-                erow = LinearLayout(this)
-                erow.orientation = LinearLayout.HORIZONTAL
-                erow.weightSum = 8f
-                eBox.addView(erow, LinearLayout.LayoutParams(MATCH, dp(46)))
-            }
-            erow.addView(makeKey(em, null, 22f) { punct(em) }, lp(0, MATCH, 1f))
-        }
-        eScroll.addView(eBox)
-        emojiArea.addView(eScroll, LinearLayout.LayoutParams(0, MATCH, 6f))
-        val eRight = LinearLayout(this)
-        eRight.orientation = LinearLayout.VERTICAL
-        eRight.addView(makeBackspaceKey(), lp(MATCH, 0, 1f))
-        eRight.addView(makeKey("!?#", null, 16f) { showPanel(1) }, lp(MATCH, 0, 1f))
-        eRight.addView(makeKey("123", null, 18f) { showPanel(2) }, lp(MATCH, 0, 1f))
-        emojiArea.addView(eRight, LinearLayout.LayoutParams(0, MATCH, 1f))
-        root.addView(emojiArea, LinearLayout.LayoutParams(MATCH, dp(176)))
+    private fun buildClip(): LinearLayout {
+        val a = vLayout()
+        val actions = hLayout()
+        actions.addView(makeKey("Tümü", null, 14f) { doAction(android.R.id.selectAll) }, lp(0, MATCH, 1f))
+        actions.addView(makeKey("Kes", null, 14f) { doAction(android.R.id.cut) }, lp(0, MATCH, 1f))
+        actions.addView(makeKey("Kopyala", null, 14f) { doAction(android.R.id.copy) }, lp(0, MATCH, 1f))
+        actions.addView(makeKey("Yapıştır", null, 14f) { doAction(android.R.id.paste) }, lp(0, MATCH, 1f))
+        a.addView(actions, lp(MATCH, dp(44), 0f))
 
-        // Pano alanı
-        clipArea = LinearLayout(this)
-        clipArea.orientation = LinearLayout.VERTICAL
-        val actions = LinearLayout(this)
-        actions.orientation = LinearLayout.HORIZONTAL
-        actions.addView(makeKey("Tümünü seç", null, 12f) { doAction(android.R.id.selectAll) }, lp(0, MATCH, 1.4f))
-        actions.addView(makeKey("Kes", null, 13f) { doAction(android.R.id.cut) }, lp(0, MATCH, 1f))
-        actions.addView(makeKey("Kopyala", null, 13f) { doAction(android.R.id.copy) }, lp(0, MATCH, 1.2f))
-        actions.addView(makeKey("Yapıştır", null, 13f) { doAction(android.R.id.paste) }, lp(0, MATCH, 1.3f))
-        actions.addView(makeBackspaceKey(), lp(0, MATCH, 0.9f))
-        clipArea.addView(actions, LinearLayout.LayoutParams(MATCH, dp(44)))
-        val cScroll = ScrollView(this)
-        clipList = LinearLayout(this)
-        clipList.orientation = LinearLayout.VERTICAL
-        cScroll.addView(clipList)
-        clipArea.addView(cScroll, LinearLayout.LayoutParams(MATCH, 0, 1f))
-        root.addView(clipArea, LinearLayout.LayoutParams(MATCH, dp(176)))
+        val sv = ScrollView(this)
+        clipList = vLayout()
+        sv.addView(clipList)
+        a.addView(sv, lp(MATCH, 0, 1f))
+        return a
+    }
+
+    override fun onCreateInputView(): View {
+        val root = vLayout()
+        root.setBackgroundColor(Color.parseColor("#1F2326"))
+        root.setPadding(dp(2), dp(2), dp(2), dp(2))
+
+        // Üst satır: pano düğmesi + öneri çubuğu
+        val top = hLayout()
+        top.addView(makeKey("📋", null, 20f) { togglePano() }, lp(dp(56), MATCH, 0f))
+        val hs = HorizontalScrollView(this)
+        hs.isHorizontalScrollBarEnabled = false
+        candidateBar = hLayout()
+        hs.addView(candidateBar)
+        top.addView(hs, LinearLayout.LayoutParams(0, MATCH, 1f))
+        root.addView(top, LinearLayout.LayoutParams(MATCH, dp(48)))
+
+        // Orta alan: paneller
+        mainArea = buildMain()
+        symbolArea = buildSymbols()
+        numArea = buildNumbers()
+        emojiArea = buildEmoji()
+        clipArea = buildClip()
+        val frame = FrameLayout(this)
+        for (area in listOf(mainArea, symbolArea, numArea, emojiArea, clipArea)) {
+            frame.addView(area, FrameLayout.LayoutParams(MATCH, MATCH))
+        }
+        root.addView(frame, LinearLayout.LayoutParams(MATCH, dp(200)))
 
         // Alt satır
-        val bottom = LinearLayout(this)
-        bottom.orientation = LinearLayout.HORIZONTAL
-        modeKey = makeKey("12#", null, 16f) { toggleMode() }
-        bottom.addView(modeKey, lp(0, MATCH, 1f))
-        t9Key = makeKey("T9", if (t9On) "açık" else "kapalı", 15f) { toggleT9() }
-        t9Key.setTextColor(if (t9On) teal else Color.WHITE)
-        bottom.addView(t9Key, lp(0, MATCH, 1f))
-        bottom.addView(makeKey(",", null) { punct(",") }, lp(0, MATCH, 0.7f))
-        bottom.addView(makeKey("Türkçe", null, 14f) { punct(" ") }, lp(0, MATCH, 3f))
-        bottom.addView(makeKey(".", null) { punct(".") }, lp(0, MATCH, 0.7f))
-        bottom.addView(makeKey("↵", null, 22f) { onEnter() }, lp(0, MATCH, 1.2f))
+        val bottom = hLayout()
+        modeKey = makeKey("12#", null, 18f) { toggleMode() }
+        t9Key = makeKey("T9", "açık", 20f) { toggleT9() }
+        t9Key.setTextColor(teal)
+        bottom.addView(modeKey, lp(0, MATCH, 1.2f))
+        bottom.addView(t9Key, lp(0, MATCH, 1.2f))
+        bottom.addView(makeKey(",", null, 22f) { punct(",") }, lp(0, MATCH, 0.8f))
+        bottom.addView(makeKey("Türkçe", null, 16f) { onSpace() }, lp(0, MATCH, 4f))
+        bottom.addView(makeKey(".", null, 22f) { punct(".") }, lp(0, MATCH, 0.8f))
+        bottom.addView(makeKey("↵", null, 22f) { onEnter() }, lp(0, MATCH, 1.4f))
         root.addView(bottom, LinearLayout.LayoutParams(MATCH, dp(52)))
 
-        showPanel(panel)
+        showPanel(0)
+        uiReady = true
+        renderBar()
         return root
     }
 }
